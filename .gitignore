@@ -1,0 +1,13 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Secrets (real file is gitignored, .example version is committed)
+include/secrets.h
+
+# Editor/OS cruft
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

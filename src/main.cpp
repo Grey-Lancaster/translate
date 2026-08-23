@@ -272,10 +272,104 @@ static void updateTranslatedLabel(const char *text) {
   step(text);
 }
 
+// Streams the Piper server's response (see tools/piper_server/) straight
+// into I2S.write() -- the server already upsamples Piper's 22050Hz mono
+// output to the fixed 44100Hz stereo format this firmware's I2S bus runs
+// at, so no resampling is needed here, just buffer-and-play. Buffered fully
+// in PSRAM first (like the STT recording buffer) rather than streamed
+// sample-by-sample, since a translated sentence is only a few hundred KB.
+static void playTranslationAudio(const String &text, const char *lang) {
+  if (text.length() == 0) return;
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(30000);
+  http.begin(client, PIPER_SERVER_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  JsonDocument reqDoc;
+  reqDoc["text"] = text;
+  reqDoc["lang"] = lang;
+  String reqBody;
+  serializeJson(reqDoc, reqBody);
+
+  int httpCode = http.POST(reqBody);
+  if (httpCode != 200) {
+    step(("TTS request failed, HTTP " + String(httpCode)).c_str());
+    http.end();
+    return;
+  }
+
+  int contentLength = http.getSize();
+  if (contentLength <= 0) {
+    step("TTS response had no content length");
+    http.end();
+    return;
+  }
+
+  uint8_t *audioOut = (uint8_t *)ps_malloc(contentLength);
+  if (audioOut == nullptr) {
+    step("ERROR - PSRAM alloc failed for TTS audio");
+    http.end();
+    return;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  size_t received = 0;
+  unsigned long lastDataMs = millis();
+  while (received < (size_t)contentLength && millis() - lastDataMs < 10000) {
+    size_t avail = stream->available();
+    if (avail > 0) {
+      size_t toRead = min(avail, (size_t)contentLength - received);
+      int r = stream->readBytes(audioOut + received, toRead);
+      if (r > 0) {
+        received += r;
+        lastDataMs = millis();
+      }
+    } else {
+      delay(1);
+    }
+  }
+  http.end();
+
+  if (received == (size_t)contentLength) {
+    step("TTS audio received, playing...");
+    // The actual bug behind every earlier silent/truncated attempt: the
+    // I2S driver's output ring buffer is only ~8KB (2 DMA buffers * 1024
+    // samples * stereo * 2 bytes -- see I2SClass::begin()/_buffer_byte_size
+    // in the Arduino I2S library), but a translated sentence's audio is
+    // routinely 300KB+. xRingbufferSend() rejects an item bigger than the
+    // ring's total capacity IMMEDIATELY regardless of blocking mode -- that
+    // explains the suspiciously fast ~4ms returns seen in every earlier
+    // version of this function (single write_nonblocking, single
+    // write_blocking, and manually-sized chunking that still exceeded 8KB
+    // per chunk): each one was being silently REJECTED, not queued, so
+    // zero audio ever reached the codec. Chunking to audioBufferBytes (the
+    // same size already used for I2S.read() elsewhere, guaranteed to fit
+    // one DMA buffer) makes each write_blocking() call both fit the ring
+    // buffer AND genuinely block for that chunk's real playback duration,
+    // which also naturally keeps loop()'s I2S.read() from interleaving
+    // mid-sentence -- no separate delay() needed.
+    size_t written = 0;
+    while (written < (size_t)contentLength) {
+      size_t chunk = min(audioBufferBytes, (size_t)contentLength - written);
+      I2S.write_blocking(audioOut + written, chunk);
+      written += chunk;
+    }
+    step("TTS playback complete");
+  } else {
+    step("ERROR - TTS audio download incomplete");
+  }
+  free(audioOut);
+}
+
 // Same request pattern confirmed working in the earlier isolated Claude API
 // test (v0.4.9): one-shot translate-only system prompt, thinking disabled.
 // Detects EN vs DE automatically rather than assuming a fixed direction, so
 // this works the same regardless of which language was actually spoken.
+// Response is JSON ({"lang":"en"|"de","text":"..."}) rather than plain text
+// so the firmware knows which Piper voice to use for playback without
+// re-detecting the language itself.
 static void translateText(const String &text) {
   if (text.length() == 0 || text.startsWith("ERROR") || text.startsWith("HTTP ") || text.startsWith("JSON parse error")) {
     return; // nothing meaningful to translate
@@ -296,7 +390,7 @@ static void translateText(const String &text) {
   JsonDocument reqDoc;
   reqDoc["model"] = "claude-sonnet-5";
   reqDoc["max_tokens"] = 1024;
-  reqDoc["system"] = "Translate English to German or German to English. Detect the input language automatically. Output only the translation, nothing else.";
+  reqDoc["system"] = "Translate the user's message between English and German (English to German, or German to English), detecting the input language automatically. Respond with ONLY a JSON object of the form {\"lang\":\"en\",\"text\":\"...\"} or {\"lang\":\"de\",\"text\":\"...\"} -- lang is the language of the translated text, text is the translation. No markdown, no code fences, no other text.";
   reqDoc["thinking"]["type"] = "disabled";
   JsonArray messages = reqDoc["messages"].to<JsonArray>();
   JsonObject msg = messages.add<JsonObject>();
@@ -315,10 +409,29 @@ static void translateText(const String &text) {
     DeserializationError err = deserializeJson(respDoc, respBody);
     if (err) {
       updateTranslatedLabel(("JSON parse error: " + String(err.c_str())).c_str());
-    } else {
-      const char *translated = respDoc["content"][0]["text"];
-      updateTranslatedLabel(translated != nullptr ? translated : "(empty translation)");
+      return;
     }
+    const char *rawText = respDoc["content"][0]["text"];
+    if (rawText == nullptr) {
+      updateTranslatedLabel("(empty translation)");
+      return;
+    }
+    JsonDocument innerDoc;
+    DeserializationError innerErr = deserializeJson(innerDoc, rawText);
+    if (innerErr) {
+      // Claude didn't return valid JSON -- fall back to showing the raw
+      // text so a translation is still visible, just without TTS.
+      updateTranslatedLabel(rawText);
+      return;
+    }
+    const char *lang = innerDoc["lang"];
+    const char *translated = innerDoc["text"];
+    if (translated == nullptr) {
+      updateTranslatedLabel("(empty translation)");
+      return;
+    }
+    updateTranslatedLabel(translated);
+    playTranslationAudio(String(translated), lang != nullptr ? lang : "en");
   } else {
     updateTranslatedLabel(("HTTP " + String(httpCode) + " error: " + respBody).c_str());
   }
@@ -488,9 +601,9 @@ void setup() {
 
   setupWifiAndOta();
 
-  // AP_ENABLE polarity tested both ways (LOW matches Freenove's own
-  // example; HIGH was tried as a diagnostic) -- neither changed the
-  // silent-speaker symptom, so reverting to Freenove's documented LOW.
+  // Retested post-MCLK-fix: HIGH made playback fully silent (worse than
+  // LOW's faint-but-audible result), so reverting to LOW -- matches
+  // Freenove's own documented default.
   pinMode(AP_ENABLE, OUTPUT);
   digitalWrite(AP_ENABLE, LOW);
   step("setup: AP_ENABLE set low");
@@ -581,10 +694,40 @@ static void handleTapToSpeak() {
   wasTouched = isTouched;
 }
 
+// Debug-only serial hook so TTS playback (and its timing) can be tested by
+// sending a line over USB serial, without needing a physical tap -- skips
+// the mic/STT/translate steps entirely and calls playTranslationAudio()
+// directly. Format: "TTSEN <text>" or "TTSDE <text>".
+static void handleSerialTtsTest() {
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("TTSEN ")) {
+      playTranslationAudio(line.substring(6), "en");
+    } else if (line.startsWith("TTSDE ")) {
+      playTranslationAudio(line.substring(6), "de");
+    } else if (line == "PASSTHROUGH") {
+      // Re-runs the exact continuous read+write pattern confirmed working
+      // for the speaker in the original v0.4.13 passthrough test (mic
+      // feedback squeal/hum), to check whether basic speaker output still
+      // works on the current firmware/hardware state at all, independent
+      // of the TTS download/buffering code.
+      step("PASSTHROUGH: starting 3s of continuous read+write");
+      unsigned long endMs = millis() + 3000;
+      while (millis() < endMs) {
+        I2S.read(audioBuffer, audioBufferBytes);
+        I2S.write(audioBuffer, audioBufferBytes);
+      }
+      step("PASSTHROUGH: done");
+    }
+  }
+}
+
 void loop() {
   ArduinoOTA.handle();
   lv_timer_handler();
   handleTapToSpeak();
+  handleSerialTtsTest();
 
   if (statusLine.startsWith("ERROR") || statusLine == "not started yet") {
     Serial.println(statusLine);

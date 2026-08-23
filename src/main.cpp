@@ -1,9 +1,17 @@
 // Code by Grey and my buddy Claude AI
 //
-// First integration pass: boot logo + "Hello Grey"/IP display (LVGL,
-// confirmed pattern from the earlier isolated display bring-up) layered on
-// top of the confirmed-working WiFi+OTA+audio-passthrough base from
-// v0.4.13/this-session. Touch is NOT wired in yet -- next step.
+// Integration: boot logo + main "Papa Lanc Translates" screen (LVGL),
+// WiFi+OTA, audio, and Groq Whisper STT.
+//
+// A BOOT-button-triggered sys-info screen was tried and pulled back out
+// 2026-08-22: GPIO0 read a steady LOW on this board regardless of the
+// physical button, even with zero serial connection open (ruling out a
+// software/DTR interaction) -- likely an onboard auto-program circuit
+// that doesn't fully release the line while USB stays enumerated. Revisit
+// via a touch gesture instead of the physical button if this is wanted
+// again; the FT6336U touch driver (touchCtrl) is still initialized below
+// and confirmed reliable (used it to path back from that sys-info screen
+// while debugging).
 //
 // Uses the OLDER bundled Arduino-ESP32 I2S.h library (I2SClass global
 // `I2S` object), not the newer ESP_I2S.h/recordWAV()/playWAV() API
@@ -40,13 +48,20 @@
 #include "secrets.h"
 #include "pins.h"
 #include "boot_logo_cyd.h"
+#include "FT6336U.h"
+#include "translate_fonts.h"
 
 TFT_eSPI tft = TFT_eSPI();
+// Named touchCtrl, not touch -- FT6336U.h's own TouchStatusEnum declares an
+// enum value literally named `touch`, which collides with an object of that
+// name at global scope.
+FT6336U touchCtrl(TOUCH_I2C_SDA, TOUCH_I2C_SCL, TOUCH_RST_PIN, TOUCH_INT_PIN);
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t lvglBuf[SCREEN_W * 40];
-static lv_obj_t *ipLabel = nullptr;
+static lv_obj_t *translateScreen = nullptr;
 static lv_obj_t *sttLabel = nullptr;
+static lv_obj_t *translatedLabel = nullptr;
 
 static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
   uint32_t w = area->x2 - area->x1 + 1;
@@ -82,6 +97,7 @@ String statusLine = "not started yet";
 int16_t peakLevel = 0;
 unsigned long lastReportMs = 0;
 String transcriptionResult = "not started yet";
+String translationResult = "";
 
 // Step-by-step progress printed directly from setup() (with an explicit
 // flush after each line) rather than only via the periodic loop() report --
@@ -123,12 +139,12 @@ void setupWifiAndOta() {
   step("setup: ArduinoOTA ready");
 }
 
-// Boot logo on a white background for 5 seconds, then the "Hello Grey" +
-// IP-address screen -- confirmed-working pattern from the earlier isolated
-// display bring-up this session. A blocking delay(5000) is used rather
-// than an LVGL timer since this all happens before loop()/lv_timer_handler
-// are pumped anyway, and WiFi/audio init below need to happen regardless.
-static void showBootLogoThenHelloScreen() {
+// Boot logo on a white background for 5 seconds, then the main translate
+// screen -- confirmed-working pattern from the earlier isolated display
+// bring-up this session. A blocking delay(5000) is used rather than an
+// LVGL timer since this all happens before loop()/lv_timer_handler are
+// pumped anyway, and WiFi/audio init below need to happen regardless.
+static void showBootLogoThenMainScreen() {
   lv_obj_t *logoScreen = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(logoScreen, lv_color_white(), 0);
   lv_obj_set_style_border_width(logoScreen, 0, 0);
@@ -141,28 +157,30 @@ static void showBootLogoThenHelloScreen() {
   lv_timer_handler();
   delay(5000);
 
-  lv_obj_t *helloScreen = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(helloScreen, lv_color_white(), 0);
-  lv_obj_set_style_border_width(helloScreen, 0, 0);
+  translateScreen = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(translateScreen, lv_color_white(), 0);
+  lv_obj_set_style_border_width(translateScreen, 0, 0);
 
-  lv_obj_t *helloLabel = lv_label_create(helloScreen);
-  lv_label_set_text(helloLabel, "Hello Grey");
-  lv_obj_set_style_text_color(helloLabel, lv_color_black(), 0);
-  lv_obj_align(helloLabel, LV_ALIGN_CENTER, 0, -10);
+  lv_obj_t *titleLabel = lv_label_create(translateScreen);
+  lv_label_set_text(titleLabel, "Papa Lanc Translates");
+  lv_obj_set_style_text_color(titleLabel, lv_color_black(), 0);
+  lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 15);
 
-  ipLabel = lv_label_create(helloScreen);
-  lv_label_set_text(ipLabel, "connecting to WiFi...");
-  lv_obj_set_style_text_color(ipLabel, lv_color_black(), 0);
-  lv_obj_align(ipLabel, LV_ALIGN_CENTER, 0, 15);
-
-  sttLabel = lv_label_create(helloScreen);
-  lv_label_set_text(sttLabel, "");
+  sttLabel = lv_label_create(translateScreen);
+  lv_label_set_text(sttLabel, "Tap anywhere to speak");
   lv_obj_set_style_text_color(sttLabel, lv_color_black(), 0);
   lv_label_set_long_mode(sttLabel, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(sttLabel, SCREEN_W - 20);
-  lv_obj_align(sttLabel, LV_ALIGN_CENTER, 0, 60);
+  lv_obj_align(sttLabel, LV_ALIGN_TOP_MID, 0, 50);
 
-  lv_scr_load(helloScreen);
+  translatedLabel = lv_label_create(translateScreen);
+  lv_label_set_text(translatedLabel, "");
+  lv_obj_set_style_text_color(translatedLabel, lv_color_black(), 0);
+  lv_label_set_long_mode(translatedLabel, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(translatedLabel, SCREEN_W - 20);
+  lv_obj_align(translatedLabel, LV_ALIGN_TOP_MID, 0, 150);
+
+  lv_scr_load(translateScreen);
   lv_timer_handler();
 }
 
@@ -210,13 +228,100 @@ static void writeWavHeader(uint8_t *buf, uint32_t pcmBytes) {
   memcpy(buf + 40, &pcmBytes, 4);
 }
 
+// LVGL labels don't have a built-in "shrink font to fit" mode -- this
+// measures the wrapped text at each available font size (largest first)
+// and picks the biggest one that still fits within maxHeightPx, falling
+// back to the smallest if even that overflows. Keeps a long sentence fully
+// visible instead of overlapping the label below it or running off-screen.
+static void setLabelTextAutoShrink(lv_obj_t *label, const char *text, lv_coord_t maxHeightPx) {
+  // Custom fonts (translate_fonts.h), not LVGL's built-in Montserrat --
+  // the built-in ones only cover ASCII, no German umlauts.
+  static const lv_font_t *fonts[] = { &lv_font_translate_14, &lv_font_translate_12, &lv_font_translate_10 };
+  const int fontCount = sizeof(fonts) / sizeof(fonts[0]);
+  const lv_coord_t maxWidth = SCREEN_W - 20;
+
+  int chosen = fontCount - 1;
+  for (int i = 0; i < fontCount; i++) {
+    lv_point_t size;
+    lv_txt_get_size(&size, text, fonts[i], 0, 0, maxWidth, LV_TEXT_FLAG_NONE);
+    if (size.y <= maxHeightPx) {
+      chosen = i;
+      break;
+    }
+  }
+
+  lv_obj_set_style_text_font(label, fonts[chosen], 0);
+  lv_label_set_text(label, text);
+}
+
 static void updateSttLabel(const char *text) {
   transcriptionResult = text;
   if (sttLabel != nullptr) {
-    lv_label_set_text(sttLabel, text);
+    setLabelTextAutoShrink(sttLabel, text, 80);
     lv_timer_handler();
   }
   step(text);
+}
+
+static void updateTranslatedLabel(const char *text) {
+  translationResult = text;
+  if (translatedLabel != nullptr) {
+    setLabelTextAutoShrink(translatedLabel, text, 80);
+    lv_timer_handler();
+  }
+  step(text);
+}
+
+// Same request pattern confirmed working in the earlier isolated Claude API
+// test (v0.4.9): one-shot translate-only system prompt, thinking disabled.
+// Detects EN vs DE automatically rather than assuming a fixed direction, so
+// this works the same regardless of which language was actually spoken.
+static void translateText(const String &text) {
+  if (text.length() == 0 || text.startsWith("ERROR") || text.startsWith("HTTP ") || text.startsWith("JSON parse error")) {
+    return; // nothing meaningful to translate
+  }
+
+  updateTranslatedLabel("Translating...");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(30000);
+  HTTPClient https;
+  https.setTimeout(30000);
+  https.begin(client, "https://api.anthropic.com/v1/messages");
+  https.addHeader("Content-Type", "application/json");
+  https.addHeader("x-api-key", ANTHROPIC_API_KEY);
+  https.addHeader("anthropic-version", "2023-06-01");
+
+  JsonDocument reqDoc;
+  reqDoc["model"] = "claude-sonnet-5";
+  reqDoc["max_tokens"] = 1024;
+  reqDoc["system"] = "Translate English to German or German to English. Detect the input language automatically. Output only the translation, nothing else.";
+  reqDoc["thinking"]["type"] = "disabled";
+  JsonArray messages = reqDoc["messages"].to<JsonArray>();
+  JsonObject msg = messages.add<JsonObject>();
+  msg["role"] = "user";
+  msg["content"] = text;
+
+  String reqBody;
+  serializeJson(reqDoc, reqBody);
+
+  int httpCode = https.POST(reqBody);
+  String respBody = https.getString();
+  https.end();
+
+  if (httpCode == 200) {
+    JsonDocument respDoc;
+    DeserializationError err = deserializeJson(respDoc, respBody);
+    if (err) {
+      updateTranslatedLabel(("JSON parse error: " + String(err.c_str())).c_str());
+    } else {
+      const char *translated = respDoc["content"][0]["text"];
+      updateTranslatedLabel(translated != nullptr ? translated : "(empty translation)");
+    }
+  } else {
+    updateTranslatedLabel(("HTTP " + String(httpCode) + " error: " + respBody).c_str());
+  }
 }
 
 static void recordAndTranscribe() {
@@ -225,12 +330,27 @@ static void recordAndTranscribe() {
     return;
   }
 
-  updateSttLabel("Get ready to speak...");
-  delay(2000);
+  updateTranslatedLabel(""); // clear any translation from a previous tap
 
-  char recMsg[32];
-  snprintf(recMsg, sizeof(recMsg), "Recording (%ds)...", RECORD_SECONDS);
+  // Short pause instead of the old 2s countdown -- the tap itself is now
+  // the "get ready" signal, this just avoids catching the tap sound/finger
+  // lift in the recording.
+  updateSttLabel("Get ready...");
+  delay(300);
+
+  // Countdown alternates English/German each second (5=EN, 4=DE, 3=EN,
+  // 2=DE, 1=EN) -- odd seconds in English, even in German.
+  char recMsg[24];
+  auto formatCountdown = [](char *out, size_t outSize, int seconds) {
+    if (seconds % 2 == 1) {
+      snprintf(out, outSize, "Listening %ds", seconds);
+    } else {
+      snprintf(out, outSize, "Höre zu %ds", seconds);
+    }
+  };
+  formatCountdown(recMsg, sizeof(recMsg), RECORD_SECONDS);
   updateSttLabel(recMsg);
+  int lastSecondShown = RECORD_SECONDS;
 
   static const char *BOUNDARY = "ESP32FormBoundary7MA4YWxkTrZu0gW";
   String part1 = String("--") + BOUNDARY + "\r\n" +
@@ -274,6 +394,14 @@ static void recordAndTranscribe() {
       destMono[i] = stereoSamples[i * 2]; // left channel only
     }
     recordedMonoBytes += framesToCopy * 2;
+
+    int elapsedSeconds = (int)((recordedMonoBytes / 2) / SAMPLE_RATE);
+    int secondsRemaining = RECORD_SECONDS - elapsedSeconds;
+    if (secondsRemaining >= 1 && secondsRemaining != lastSecondShown) {
+      formatCountdown(recMsg, sizeof(recMsg), secondsRemaining);
+      updateSttLabel(recMsg);
+      lastSecondShown = secondsRemaining;
+    }
   }
   offset += RECORD_PCM_BYTES;
   memcpy(buf + offset, trailer.c_str(), trailer.length());
@@ -327,6 +455,9 @@ static void recordAndTranscribe() {
     } else {
       const char *text = respDoc["text"];
       updateSttLabel(text != nullptr ? text : "(empty transcription)");
+      if (text != nullptr) {
+        translateText(String(text));
+      }
     }
   } else {
     updateSttLabel(("HTTP " + String(httpCode) + " error: " + respBody).c_str());
@@ -352,20 +483,10 @@ void setup() {
   lv_disp_drv_register(&disp_drv);
   step("setup: TFT_eSPI + LVGL init done");
 
-  showBootLogoThenHelloScreen();
-  step("setup: boot logo shown, hello screen loaded");
+  showBootLogoThenMainScreen();
+  step("setup: boot logo shown, main screen loaded");
 
   setupWifiAndOta();
-
-  if (ipLabel != nullptr) {
-    if (WiFi.status() == WL_CONNECTED) {
-      String ipText = "Your IP is " + WiFi.localIP().toString();
-      lv_label_set_text(ipLabel, ipText.c_str());
-    } else {
-      lv_label_set_text(ipLabel, "WiFi connect failed");
-    }
-    lv_timer_handler();
-  }
 
   // AP_ENABLE polarity tested both ways (LOW matches Freenove's own
   // example; HIGH was tried as a diagnostic) -- neither changed the
@@ -423,6 +544,14 @@ void setup() {
   }
   step("setup: es8311_codec_init done");
 
+  // Touch init happens last, after the codec's I2C traffic is done for
+  // good -- FT6336U::begin() unconditionally calls Wire.begin(sda, scl)
+  // again (with no speed argument, so back to the ESP32 I2C default),
+  // which would reset our earlier Wire.begin(..., I2C_SPEED) if it ran
+  // first. The codec never touches I2C again after init, so this is safe.
+  touchCtrl.begin();
+  step("setup: FT6336U touch init done");
+
   audioBufferBytes = I2S.getBufferSize() * (BITS_PER_SAMPLE / 8);
   audioBuffer = (uint8_t *)malloc(audioBufferBytes);
   if (audioBuffer == NULL) {
@@ -434,13 +563,28 @@ void setup() {
 
   statusLine = "OK - running passthrough, talk into the mic";
   step("setup: complete, entering loop");
+}
 
-  recordAndTranscribe();
+// Tap anywhere on the translate screen to trigger a 5s recording ->
+// transcribe cycle -- lets STT accuracy get tested repeatedly without a
+// reboot each time. Edge-detected (only fires on the touch-down transition,
+// not every loop iteration while a finger stays down) so one tap = one
+// recording, not a burst of them.
+static void handleTapToSpeak() {
+  static bool wasTouched = false;
+  FT6336U_TouchPointType touchPoint = touchCtrl.scan();
+  bool isTouched = touchPoint.touch_count > 0;
+
+  if (isTouched && !wasTouched) {
+    recordAndTranscribe();
+  }
+  wasTouched = isTouched;
 }
 
 void loop() {
   ArduinoOTA.handle();
   lv_timer_handler();
+  handleTapToSpeak();
 
   if (statusLine.startsWith("ERROR") || statusLine == "not started yet") {
     Serial.println(statusLine);

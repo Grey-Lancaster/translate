@@ -478,7 +478,13 @@ esp_err_t es8311_codec_init(void)
     ESP_RETURN_ON_ERROR(es8311_sample_frequency_config(es_handle, EXAMPLE_SAMPLE_RATE * EXAMPLE_MCLK_MULTIPLE, EXAMPLE_SAMPLE_RATE), TAG, "set es8311 sample frequency failed");
     ESP_RETURN_ON_ERROR(es8311_voice_volume_set(es_handle, EXAMPLE_VOICE_VOLUME, NULL), TAG, "set es8311 volume failed");
     ESP_RETURN_ON_ERROR(es8311_microphone_config(es_handle, false), TAG, "set es8311 microphone failed");
-    // ESP_RETURN_ON_ERROR(es8311_microphone_gain_set(es_handle, ES8311_MIC_GAIN_24DB), TAG, "set es8311 microphone gain failed");
+    /* Enabled 2026-08-22 (Grey's translate project): a Whisper transcription
+     * came back correct for the first word then hallucinated fluent but
+     * unrelated text for the rest -- Whisper's classic low-confidence
+     * behavior on a weak/noisy signal. This is a SEPARATE digital gain
+     * stage from the PGA gain es8311_microphone_config() already sets;
+     * enabling it as a first attempt at boosting effective mic signal. */
+    ESP_RETURN_ON_ERROR(es8311_microphone_gain_set(es_handle, ES8311_MIC_GAIN_24DB), TAG, "set es8311 microphone gain failed");
     // DIAGNOSTIC (Grey's translate project): explicit unmute added here --
     // the DAC mute register's power-on-reset default isn't documented in
     // this vendored copy, and the original init sequence never calls

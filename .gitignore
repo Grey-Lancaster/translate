@@ -3,6 +3,11 @@
 .pioenvs/
 .piolibdeps/
 
+# Local firmware .bin backups -- binary build artifacts, not source;
+# regenerable from git history + a rebuild. Kept locally for quick
+# recovery flashing without needing this machine's Claude session again.
+firmware_backups/
+
 # Secrets (real file is gitignored, .example version is committed)
 include/secrets.h
 

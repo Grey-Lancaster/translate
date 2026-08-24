@@ -53,7 +53,7 @@
 // on the BOOT-button sys-info screen next to the auto-generated build
 // timestamp, so a running device can be matched to a specific release
 // without guessing from the timestamp alone.
-#define FIRMWARE_VERSION "v0.4.41"
+#define FIRMWARE_VERSION "v0.4.45"
 
 TFT_eSPI tft = TFT_eSPI();
 // Named touchCtrl, not touch -- FT6336U.h's own TouchStatusEnum declares an
@@ -229,19 +229,19 @@ static void showSysInfoScreen() {
   unsigned int uptimeM = (uptimeSec % 3600) / 60;
   unsigned int uptimeS = uptimeSec % 60;
 
-  uint32_t freeHeap = ESP.getFreeHeap();
-  uint32_t freePsram = ESP.getFreePsram();
+  unsigned int freeHeapPct = (unsigned int)((uint64_t)ESP.getFreeHeap() * 100 / ESP.getHeapSize());
+  unsigned int freePsramPct = (unsigned int)((uint64_t)ESP.getFreePsram() * 100 / ESP.getPsramSize());
 
   char info[320];
   if (WiFi.status() == WL_CONNECTED) {
     snprintf(info, sizeof(info),
-             "Version: %s\nSSID: %s\nIP: %s\nRSSI: %d dBm\nUptime: %uh %um %us\nFree heap: %u bytes\nFree PSRAM: %u bytes\nBuilt: %s %s",
+             "Version: %s\nSSID: %s\nIP: %s\nRSSI: %d dBm\nUptime: %uh %um %us\nFree heap: %u%%\nFree PSRAM: %u%%\nBuilt: %s %s",
              FIRMWARE_VERSION, WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI(),
-             uptimeH, uptimeM, uptimeS, freeHeap, freePsram, __DATE__, __TIME__);
+             uptimeH, uptimeM, uptimeS, freeHeapPct, freePsramPct, __DATE__, __TIME__);
   } else {
     snprintf(info, sizeof(info),
-             "Version: %s\nWiFi: not connected\nUptime: %uh %um %us\nFree heap: %u bytes\nFree PSRAM: %u bytes\nBuilt: %s %s",
-             FIRMWARE_VERSION, uptimeH, uptimeM, uptimeS, freeHeap, freePsram, __DATE__, __TIME__);
+             "Version: %s\nWiFi: not connected\nUptime: %uh %um %us\nFree heap: %u%%\nFree PSRAM: %u%%\nBuilt: %s %s",
+             FIRMWARE_VERSION, uptimeH, uptimeM, uptimeS, freeHeapPct, freePsramPct, __DATE__, __TIME__);
   }
   lv_label_set_text(sysInfoLabel, info);
 

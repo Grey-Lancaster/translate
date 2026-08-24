@@ -60,6 +60,9 @@ static lv_color_t lvglBuf[SCREEN_W * 40];
 static lv_obj_t *translateScreen = nullptr;
 static lv_obj_t *sttLabel = nullptr;
 static lv_obj_t *translatedLabel = nullptr;
+static lv_obj_t *sysInfoScreen = nullptr;
+static lv_obj_t *sysInfoLabel = nullptr;
+static bool onSysInfoScreen = false;
 
 static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
   uint32_t w = area->x2 - area->x1 + 1;
@@ -179,6 +182,64 @@ static void showBootLogoThenMainScreen() {
   lv_obj_set_width(translatedLabel, SCREEN_W - 20);
   lv_obj_align(translatedLabel, LV_ALIGN_TOP_MID, 0, 150);
 
+  lv_scr_load(translateScreen);
+  lv_timer_handler();
+}
+
+// Built lazily on first BOOT-button press rather than at boot alongside
+// translateScreen -- WiFi may not have connected yet at that point in
+// setup(), and the label text is refreshed live each time this screen is
+// shown anyway, so there's no benefit to constructing it earlier.
+static void buildSysInfoScreenIfNeeded() {
+  if (sysInfoScreen != nullptr) return;
+
+  sysInfoScreen = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(sysInfoScreen, lv_color_white(), 0);
+  lv_obj_set_style_border_width(sysInfoScreen, 0, 0);
+
+  lv_obj_t *titleLabel = lv_label_create(sysInfoScreen);
+  lv_label_set_text(titleLabel, "System Info");
+  lv_obj_set_style_text_color(titleLabel, lv_color_black(), 0);
+  lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 15);
+
+  sysInfoLabel = lv_label_create(sysInfoScreen);
+  lv_label_set_text(sysInfoLabel, "");
+  lv_obj_set_style_text_color(sysInfoLabel, lv_color_black(), 0);
+  lv_label_set_long_mode(sysInfoLabel, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(sysInfoLabel, SCREEN_W - 20);
+  lv_obj_align(sysInfoLabel, LV_ALIGN_TOP_MID, 0, 60);
+
+  lv_obj_t *hintLabel = lv_label_create(sysInfoScreen);
+  lv_label_set_text(hintLabel, "Tap to go back");
+  lv_obj_set_style_text_color(hintLabel, lv_color_black(), 0);
+  lv_obj_align(hintLabel, LV_ALIGN_BOTTOM_MID, 0, -15);
+}
+
+static void showSysInfoScreen() {
+  buildSysInfoScreenIfNeeded();
+
+  unsigned long uptimeSec = millis() / 1000;
+  unsigned int uptimeH = uptimeSec / 3600;
+  unsigned int uptimeM = (uptimeSec % 3600) / 60;
+  unsigned int uptimeS = uptimeSec % 60;
+
+  char info[192];
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(info, sizeof(info), "SSID: %s\nIP: %s\nRSSI: %d dBm\nUptime: %uh %um %us",
+             WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI(),
+             uptimeH, uptimeM, uptimeS);
+  } else {
+    snprintf(info, sizeof(info), "WiFi: not connected\nUptime: %uh %um %us", uptimeH, uptimeM, uptimeS);
+  }
+  lv_label_set_text(sysInfoLabel, info);
+
+  onSysInfoScreen = true;
+  lv_scr_load(sysInfoScreen);
+  lv_timer_handler();
+}
+
+static void hideSysInfoScreen() {
+  onSysInfoScreen = false;
   lv_scr_load(translateScreen);
   lv_timer_handler();
 }
@@ -688,32 +749,35 @@ void setup() {
 // transcribe cycle -- lets STT accuracy get tested repeatedly without a
 // reboot each time. Edge-detected (only fires on the touch-down transition,
 // not every loop iteration while a finger stays down) so one tap = one
-// recording, not a burst of them.
+// recording, not a burst of them. While the sys-info screen is showing, a
+// tap instead goes back to the translate screen rather than starting a
+// recording (mirrors the earlier "tap to go back" pattern from the first
+// version of this feature).
 static void handleTapToSpeak() {
   static bool wasTouched = false;
   FT6336U_TouchPointType touchPoint = touchCtrl.scan();
   bool isTouched = touchPoint.touch_count > 0;
 
   if (isTouched && !wasTouched) {
-    recordAndTranscribe();
+    if (onSysInfoScreen) {
+      hideSysInfoScreen();
+    } else {
+      recordAndTranscribe();
+    }
   }
   wasTouched = isTouched;
 }
 
-// Validates the INPUT_PULLUP fix for GPIO0 (see setup() comment) -- active
-// LOW when pressed, edge-detected so one press = one log line, not a
-// stream of them while held. Just a serial diagnostic for now, not wired
-// to any feature; confirm this works before building anything on top of it.
-static int bootButtonPressCount = 0;
+// GPIO0/BOOT button (see setup() comment for the INPUT_PULLUP fix) shows
+// the sys-info screen (WiFi SSID/IP/RSSI) -- tap anywhere to go back.
+// Edge-detected so one press = one screen-show, not a flicker of repeated
+// triggers while held.
 static void handleBootButton() {
   static bool wasPressed = false;
   bool isPressed = (digitalRead(BOOT_BUTTON) == LOW);
 
   if (isPressed && !wasPressed) {
-    bootButtonPressCount++;
-    char msg[48];
-    snprintf(msg, sizeof(msg), "BOOT button pressed (count=%d)", bootButtonPressCount);
-    step(msg);
+    showSysInfoScreen();
   }
   wasPressed = isPressed;
 }

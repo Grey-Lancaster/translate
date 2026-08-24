@@ -4,14 +4,12 @@
 // WiFi+OTA, audio, and Groq Whisper STT.
 //
 // A BOOT-button-triggered sys-info screen was tried and pulled back out
-// 2026-08-22: GPIO0 read a steady LOW on this board regardless of the
-// physical button, even with zero serial connection open (ruling out a
-// software/DTR interaction) -- likely an onboard auto-program circuit
-// that doesn't fully release the line while USB stays enumerated. Revisit
-// via a touch gesture instead of the physical button if this is wanted
-// again; the FT6336U touch driver (touchCtrl) is still initialized below
-// and confirmed reliable (used it to path back from that sys-info screen
-// while debugging).
+// 2026-08-22: GPIO0 read a steady LOW regardless of the physical button.
+// CORRECTED 2026-08-24: this was a missing internal pull-up, not a
+// hardware dead end -- a separate project on this exact board (XiaoZhi AI)
+// reads GPIO0/BOOT reliably by explicitly enabling the pull-up
+// (active-low button, nothing was holding the line firmly HIGH when idle
+// otherwise). Re-added below with pinMode(BOOT_BUTTON, INPUT_PULLUP).
 //
 // Uses the OLDER bundled Arduino-ESP32 I2S.h library (I2SClass global
 // `I2S` object), not the newer ESP_I2S.h/recordWAV()/playWAV() API
@@ -82,6 +80,7 @@ static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *c
 #define I2S_DINT 6
 #define I2S_DOUT 8
 #define AP_ENABLE 1
+#define BOOT_BUTTON 0
 
 // I2C pins -- same bus as the FT6336U touch controller (different address)
 #define I2C_SCL 15
@@ -674,6 +673,13 @@ void setup() {
   }
   step("setup: audio buffer allocated");
 
+  // INPUT_PULLUP (not plain INPUT) is the fix for GPIO0 previously reading
+  // a steady LOW regardless of the physical button -- without an internal
+  // pull-up actively holding the line HIGH when idle, the board's
+  // auto-program circuit weakly loads it LOW instead.
+  pinMode(BOOT_BUTTON, INPUT_PULLUP);
+  step("setup: BOOT_BUTTON pinMode INPUT_PULLUP done");
+
   statusLine = "OK - running passthrough, talk into the mic";
   step("setup: complete, entering loop");
 }
@@ -692,6 +698,24 @@ static void handleTapToSpeak() {
     recordAndTranscribe();
   }
   wasTouched = isTouched;
+}
+
+// Validates the INPUT_PULLUP fix for GPIO0 (see setup() comment) -- active
+// LOW when pressed, edge-detected so one press = one log line, not a
+// stream of them while held. Just a serial diagnostic for now, not wired
+// to any feature; confirm this works before building anything on top of it.
+static int bootButtonPressCount = 0;
+static void handleBootButton() {
+  static bool wasPressed = false;
+  bool isPressed = (digitalRead(BOOT_BUTTON) == LOW);
+
+  if (isPressed && !wasPressed) {
+    bootButtonPressCount++;
+    char msg[48];
+    snprintf(msg, sizeof(msg), "BOOT button pressed (count=%d)", bootButtonPressCount);
+    step(msg);
+  }
+  wasPressed = isPressed;
 }
 
 // Debug-only serial hook so TTS playback (and its timing) can be tested by
@@ -728,6 +752,7 @@ void loop() {
   lv_timer_handler();
   handleTapToSpeak();
   handleSerialTtsTest();
+  handleBootButton();
 
   if (statusLine.startsWith("ERROR") || statusLine == "not started yet") {
     Serial.println(statusLine);
